@@ -12,7 +12,7 @@ Thanks for supporting ffpkg @Gezine, @earthonion.
 **Ubuntu/Debian:**
 * sudo apt-get install -y exfatprogs exfat-fuse fuse3 rsync
 * truncate -s <image_size> test.ffpkg
-* mkfs.exfat -n TESTFFPKG test.ffpkg
+* mkfs.exfat -c 4K test.ffpkg
 * mkdir /mnt/exfat
 * mount -t exfat-fuse -o loop test.ffpkg /mnt/exfat
 * rsync -r --info=progress2 APPXXXX/ /mnt/exfat/
