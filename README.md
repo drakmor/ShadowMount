@@ -1,27 +1,26 @@
-# ShadowMount (PS5)
+# ShadowMountPlus (PS5)
 
 
 Thanks for ffpkg support: @Gezine, @earthonion and @VoidWhisper for ShadowMount
 
 
-**ShadowMount** is a fully automated, background "Auto-Mounter" payload for Jailbroken PlayStation 5 consoles. It streamlines the game mounting process by eliminating the need for manual configuration or external tools (such as DumpRunner or Itemzflow). ShadowMount automatically detects, mounts, and installs game dumps from both **internal and external storage**.
+**ShadowMountPlus** is a fully automated, background "Auto-Mounter" payload for Jailbroken PlayStation 5 consoles. It streamlines the game mounting process by eliminating the need for manual configuration or external tools (such as DumpRunner or Itemzflow). ShadowMount automatically detects, mounts, and installs game dumps from both **internal and external storage**.
 
 **Compatibility:** Supports all Jailbroken PS5 firmwares running **Kstuff v1.6.7**.
 
 
 ## Current image support
 
-`UFS/PFS support is experimental.`
+`PFS support is experimental.`
 
 | Extension | Mounted FS | Attach backend | Status |
 | --- | --- | --- | --- |
-| `.exfat` | `exfatfs` | `/dev/mdctl` by default | Recommended |
-| `.ffpkg` | `ufs` | `/dev/lvdctl` | Experimental |
+| `.exfat` | `exfatfs` | `/dev/lvdctl` | Recommended |
+| `.ffpkg` | `ufs` | `/dev/lvdctl` | Test |
 | `.ffpfs` | `pfs` | `/dev/lvdctl` | Experimental |
 
 Notes:
-- `.exfat` can be switched to LVD backend by changing `EXFAT_ATTACH_USE_MDCTL` (not working)
-- PFS mount uses a shell-like profile (`budgetid/mkeymode/sigverify/playgo/disc`) from code defaults.
+- `.exfat` can be switched to MD backend by changing `EXFAT_ATTACH_USE_MDCTL` 
 
 ## Mount point naming
 
@@ -51,7 +50,7 @@ ShadowMount scans these locations:
 Linux (Ubuntu/Debian):
 - `sudo apt-get install -y exfatprogs exfat-fuse fuse3 rsync`
 - `truncate -s <image_size> test.exfat`
-- `mkfs.exfat -c 512 test.exfat`
+- `mkfs.exfat -c 32768 test.exfat`
 - `mkdir -p /mnt/exfat`
 - `mount -t exfat-fuse -o loop test.exfat /mnt/exfat`
 - `rsync -r --info=progress2 APPXXXX/ /mnt/exfat/`
