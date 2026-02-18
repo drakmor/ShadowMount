@@ -22,6 +22,7 @@
 Notes:
 - Backend, read-only mode, and sector size can be configured via `/data/shadowmount/config.ini`.
 - Optional debug logging can be enabled via `debug=1` (writes to console and `/data/shadowmount/debug.log`).
+- **On 4.xx firmware, shutting down the console may not work correctly when using image files.**
 
 ## Recommended FS choice
 
