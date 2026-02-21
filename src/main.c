@@ -27,10 +27,10 @@
 #include <sqlite3.h>
 
 // --- Configuration ---
-#define SCAN_INTERVAL_US 10000000
+#define DEFAULT_SCAN_INTERVAL_US 10000000u
+#define DEFAULT_STABILITY_WAIT_SECONDS 10u
 #define MAX_PENDING 512
 #define MAX_UFS_MOUNTS 64
-#define MAX_NULLFS_MOUNTS MAX_PENDING
 #define PATH_STATE_CAPACITY MAX_PENDING
 #define TITLE_STATE_CAPACITY MAX_PENDING
 #define STATE_HASH_SIZE 1024u
@@ -39,6 +39,9 @@
 #define MAX_MISSING_PARAM_SCAN_ATTEMPTS 3
 #define MAX_IMAGE_MOUNT_ATTEMPTS 3
 #define IMAGE_MOUNT_READ_ONLY 1
+#define MIN_SCAN_INTERVAL_SECONDS 1u
+#define MAX_SCAN_INTERVAL_SECONDS 3600u
+#define MAX_STABILITY_WAIT_SECONDS 3600u
 #define APP_DB_QUERY_BUSY_RETRIES 3
 #define APP_DB_UPDATE_BUSY_RETRIES 25
 #define APP_DB_PREPARE_BUSY_RETRIES 25
@@ -78,10 +81,10 @@
 #define SCE_LVD_IOC_ATTACH 0xC0286D00
 #define SCE_LVD_IOC_DETACH 0xC0286D01
 #define LVD_ATTACH_IO_VERSION 1
-#define LVD_ATTACH_OPTION_FLAGS_DEFAULT 0x8
-#define LVD_ATTACH_OPTION_FLAGS_RW 0x9
-#define LVD_ATTACH_OPTION_NORM_DD_RO 0x16
-#define LVD_ATTACH_OPTION_NORM_DD_RW 0x1E
+#define LVD_ATTACH_OPTION_FLAGS_DEFAULT 0x9
+#define LVD_ATTACH_OPTION_FLAGS_RW 0x8
+#define LVD_ATTACH_OPTION_NORM_DD_RO 0x1E
+#define LVD_ATTACH_OPTION_NORM_DD_RW 0x16
 #define LVD_SECTOR_SIZE_EXFAT 512u
 #define LVD_SECTOR_SIZE_UFS 4096u
 #define LVD_SECTOR_SIZE_PFS 32768u
@@ -224,7 +227,7 @@ void notify_system(const char *fmt, ...);
 void log_debug(const char *fmt, ...);
 static void close_app_db(void);
 static void shutdown_ufs_mounts(void);
-static void shutdown_nullfs_mounts(void);
+static void ensure_runtime_config_ready(void);
 
 // Standard Notification
 typedef struct notify_request {
@@ -300,10 +303,10 @@ struct TitleStateEntry {
 struct TitleStateEntry g_title_state[TITLE_STATE_CAPACITY];
 static uint16_t g_title_state_hash[STATE_HASH_SIZE];
 
-struct AppDbLookupCache {
-  char title_id[MAX_TITLE_ID];
-  bool in_app_db;
-  bool valid;
+struct AppDbTitleList {
+  char(*ids)[MAX_TITLE_ID];
+  int count;
+  int capacity;
 };
 
 typedef struct {
@@ -338,6 +341,8 @@ typedef struct {
   bool debug_enabled;
   bool mount_read_only;
   bool recursive_scan;
+  uint32_t scan_interval_us;
+  uint32_t stability_wait_seconds;
   attach_backend_t exfat_backend;
   attach_backend_t ufs_backend;
   uint32_t lvd_sector_exfat;
@@ -350,10 +355,8 @@ typedef struct {
 static runtime_config_t g_runtime_cfg;
 static bool g_runtime_cfg_ready = false;
 static sqlite3 *g_app_db = NULL;
-static sqlite3_stmt *g_app_db_stmt_has_title = NULL;
 static sqlite3_stmt *g_app_db_stmt_update_snd0 = NULL;
 static scan_candidate_t g_scan_candidates[MAX_PENDING];
-static struct AppDbLookupCache g_scan_db_lookup_cache[MAX_PENDING];
 static char g_scan_discovered_param_roots[MAX_PENDING][MAX_PATH];
 
 struct UfsCache {
@@ -367,14 +370,6 @@ struct UfsCache {
   bool valid;
 };
 struct UfsCache ufs_cache[MAX_UFS_MOUNTS];
-
-struct NullfsCache {
-  // Mounted target path in /system_ex/app/...
-  char mount_point[MAX_PATH];
-  // Slot occupancy flag.
-  bool valid;
-};
-struct NullfsCache nullfs_cache[MAX_NULLFS_MOUNTS];
 
 static volatile sig_atomic_t g_stop_requested = 0;
 
@@ -790,7 +785,7 @@ static void clear_image_mount_attempts(const char *path) {
   entry->image_mount_limit_logged = false;
 }
 
-// --- Active Mount and NullFS Session Caches ---
+// --- Active Mount Session Caches ---
 static void cache_ufs_mount(const char *path, int unit_id,
                             attach_backend_t backend) {
   for (int k = 0; k < MAX_UFS_MOUNTS; k++) {
@@ -807,35 +802,6 @@ static void cache_ufs_mount(const char *path, int unit_id,
       ufs_cache[k].unit_id = unit_id;
       ufs_cache[k].backend = backend;
       ufs_cache[k].valid = true;
-      return;
-    }
-  }
-}
-
-static void cache_nullfs_mount(const char *mount_point) {
-  for (int k = 0; k < MAX_NULLFS_MOUNTS; k++) {
-    if (nullfs_cache[k].valid &&
-        strcmp(nullfs_cache[k].mount_point, mount_point) == 0) {
-      return;
-    }
-  }
-  for (int k = 0; k < MAX_NULLFS_MOUNTS; k++) {
-    if (!nullfs_cache[k].valid) {
-      (void)strlcpy(nullfs_cache[k].mount_point, mount_point,
-                    sizeof(nullfs_cache[k].mount_point));
-      nullfs_cache[k].valid = true;
-      return;
-    }
-  }
-}
-
-static void invalidate_nullfs_mount(const char *mount_point) {
-  for (int k = 0; k < MAX_NULLFS_MOUNTS; k++) {
-    if (!nullfs_cache[k].valid)
-      continue;
-    if (strcmp(nullfs_cache[k].mount_point, mount_point) == 0) {
-      nullfs_cache[k].valid = false;
-      nullfs_cache[k].mount_point[0] = '\0';
       return;
     }
   }
@@ -977,28 +943,19 @@ static bool read_mount_link(const char *title_id, char *out, size_t out_size) {
   return out[0] != '\0';
 }
 
-static void build_system_ex_app_path(const char *title_id, char *out,
-                                     size_t out_size) {
-  if (out_size == 0)
-    return;
-  snprintf(out, out_size, "/system_ex/app/%s", title_id);
-}
+static bool mount_link_matches_source(const char *title_id,
+                                      const char *source_path) {
+  if (!source_path || source_path[0] == '\0')
+    return false;
 
-static bool mount_link_matches_system_ex(const char *title_id) {
   char tracked_path[MAX_PATH];
-  char expected_path[MAX_PATH];
   if (!read_mount_link(title_id, tracked_path, sizeof(tracked_path)))
     return false;
-  build_system_ex_app_path(title_id, expected_path, sizeof(expected_path));
-  return strcmp(tracked_path, expected_path) == 0;
+  return strcmp(tracked_path, source_path) == 0;
 }
 
 // --- app.db Access Layer ---
 static void close_app_db(void) {
-  if (g_app_db_stmt_has_title) {
-    sqlite3_finalize(g_app_db_stmt_has_title);
-    g_app_db_stmt_has_title = NULL;
-  }
   if (g_app_db_stmt_update_snd0) {
     sqlite3_finalize(g_app_db_stmt_update_snd0);
     g_app_db_stmt_update_snd0 = NULL;
@@ -1057,147 +1014,6 @@ static int app_db_prepare_with_retry(const char *sql, sqlite3_stmt **stmt_out,
   return -1;
 }
 
-static bool init_app_triggers(void) {
-  static const char *find_sql =
-      "SELECT substr(name, 14) FROM sqlite_master "
-      "WHERE type='table' "
-      "AND name GLOB 'tbl_iconinfo_[0-9]*' "
-      "LIMIT 1;";
-
-  for (int attempt = 0; attempt < APP_DB_UPDATE_BUSY_RETRIES; attempt++) {
-    if (!ensure_app_db_open())
-      return false;
-
-    char suffix[21];
-    suffix[0] = '\0';
-
-    sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(g_app_db, find_sql, -1, &stmt, NULL);
-    if (rc == SQLITE_OK) {
-      int step_rc = sqlite3_step(stmt);
-      if (step_rc == SQLITE_ROW) {
-        const char *val = (const char *)sqlite3_column_text(stmt, 0);
-        if (val)
-          (void)strlcpy(suffix, val, sizeof(suffix));
-        rc = SQLITE_OK;
-      } else {
-        rc = step_rc;
-      }
-    }
-    if (stmt)
-      sqlite3_finalize(stmt);
-
-    if (rc != SQLITE_OK && rc != SQLITE_DONE) {
-      log_debug("  [DB] query tbl_iconinfo failed: rc=%d err=%s", rc,
-                (g_app_db ? sqlite3_errmsg(g_app_db) : "unknown"));
-      if (app_db_wait_retry(rc, attempt, APP_DB_UPDATE_BUSY_RETRIES, true))
-        continue;
-      close_app_db();
-      return false;
-    }
-
-    if (suffix[0] == '\0') {
-      log_debug("  [DB] no tbl_iconinfo table found, skipping triggers");
-      close_app_db();
-      return true;
-    }
-
-    char table_name[34];
-    snprintf(table_name, sizeof(table_name), "tbl_iconinfo_%s", suffix);
-
-    char sql[2048];
-    snprintf(sql, sizeof(sql),
-             "CREATE TRIGGER IF NOT EXISTS trig_update_drm_tbl_iconinfo_%s "
-             "AFTER UPDATE OF appDrmType ON %s "
-             "WHEN new.appDrmType = 1 "
-             "BEGIN "
-             "UPDATE %s SET appDrmType = 5 WHERE titleId = old.titleId; "
-             "END;"
-             "CREATE TRIGGER IF NOT EXISTS trig_insert_drm_tbl_iconinfo_%s "
-             "AFTER INSERT ON %s "
-             "WHEN new.appDrmType = 1 "
-             "BEGIN "
-             "UPDATE %s SET appDrmType = 5 WHERE titleId = new.titleId; "
-             "END;"
-             "UPDATE %s SET appDrmType=5 WHERE appDrmType=1;",
-             suffix, table_name, table_name, suffix, table_name, table_name,
-             table_name);
-
-    char *err = NULL;
-    rc = sqlite3_exec(g_app_db, sql, NULL, NULL, &err);
-    if (rc == SQLITE_OK) {
-      int changes = sqlite3_changes(g_app_db);
-      log_debug("  [DB] triggers updated for %s, fixed rows=%d",
-                table_name, changes);
-      close_app_db();
-      return true;
-    }
-
-    log_debug("  [DB] update triggers failed: rc=%d err=%s", rc,
-              err ? err : (g_app_db ? sqlite3_errmsg(g_app_db) : "unknown"));
-    if (err)
-      sqlite3_free(err);
-
-    if (app_db_wait_retry(rc, attempt, APP_DB_UPDATE_BUSY_RETRIES, true))
-      continue;
-
-    close_app_db();
-    return false;
-  }
-
-  close_app_db();
-  return false;
-}
-
-static int query_title_registered_in_app_db(const char *title_id) {
-  if (!title_id || title_id[0] == '\0')
-    return 0;
-
-  if (!g_app_db_stmt_has_title) {
-    const char *sql =
-        "SELECT 1 FROM tbl_contentinfo WHERE titleId = ?1 LIMIT 1;";
-    int prep_rc = app_db_prepare_with_retry(sql, &g_app_db_stmt_has_title,
-                                            APP_DB_PREPARE_BUSY_RETRIES,
-                                            "titleId check");
-    if (prep_rc != SQLITE_OK)
-      return -1;
-  }
-
-  for (int attempt = 0; attempt < APP_DB_QUERY_BUSY_RETRIES; attempt++) {
-    sqlite3_reset(g_app_db_stmt_has_title);
-    sqlite3_clear_bindings(g_app_db_stmt_has_title);
-    if (sqlite3_bind_text(g_app_db_stmt_has_title, 1, title_id, -1,
-                          SQLITE_TRANSIENT) != SQLITE_OK) {
-      log_debug("  [DB] bind failed for titleId check: %s",
-                sqlite3_errmsg(g_app_db));
-      close_app_db();
-      return -1;
-    }
-
-    int rc = sqlite3_step(g_app_db_stmt_has_title);
-    if (rc == SQLITE_ROW || rc == SQLITE_DONE) {
-      int ret = (rc == SQLITE_ROW) ? 1 : 0;
-      // Always reset after stepping, to avoid keeping a cursor/lock open.
-      sqlite3_reset(g_app_db_stmt_has_title);
-      sqlite3_clear_bindings(g_app_db_stmt_has_title);
-      return ret;
-    }
-
-    if (app_db_wait_retry(rc, attempt, APP_DB_QUERY_BUSY_RETRIES, false))
-      continue;
-
-    if (g_app_db) {
-      log_debug("  [DB] step failed for titleId check: rc=%d err=%s", rc,
-                sqlite3_errmsg(g_app_db));
-    }
-    close_app_db();
-    return -1;
-  }
-
-  close_app_db();
-  return -1;
-}
-
 static int update_snd0info(const char *title_id) {
   if (!title_id || title_id[0] == '\0')
     return -1;
@@ -1249,104 +1065,149 @@ static int update_snd0info(const char *title_id) {
   return -1;
 }
 
-static int lookup_title_in_app_db_cached(const char *title_id,
-                                         struct AppDbLookupCache *lookup_cache,
-                                         int *cache_count) {
-  if (!title_id || title_id[0] == '\0')
-    return 0;
+static void free_app_db_title_list(struct AppDbTitleList *list) {
+  if (!list)
+    return;
+  free(list->ids);
+  list->ids = NULL;
+  list->count = 0;
+  list->capacity = 0;
+}
 
-  int count = (cache_count ? *cache_count : 0);
-  for (int i = 0; i < count; i++) {
-    if (lookup_cache[i].valid && strcmp(lookup_cache[i].title_id, title_id) == 0)
-      return lookup_cache[i].in_app_db ? 1 : 0;
+static bool append_app_db_title(struct AppDbTitleList *list,
+                                const char *title_id) {
+  if (!list || !title_id || title_id[0] == '\0')
+    return true;
+
+  if (list->count >= list->capacity) {
+    int new_capacity = (list->capacity > 0) ? (list->capacity * 2) : 1024;
+    char(*new_ids)[MAX_TITLE_ID] =
+        realloc(list->ids, (size_t)new_capacity * sizeof(*list->ids));
+    if (!new_ids)
+      return false;
+    list->ids = new_ids;
+    list->capacity = new_capacity;
   }
 
-  int q = query_title_registered_in_app_db(title_id);
-  if (q < 0)
-    return -1;
+  (void)strlcpy(list->ids[list->count], title_id, MAX_TITLE_ID);
+  list->count++;
+  return true;
+}
 
-  bool in_app_db = (q != 0);
-  if (cache_count && count < MAX_PENDING) {
-    (void)strlcpy(lookup_cache[count].title_id, title_id,
-                  sizeof(lookup_cache[count].title_id));
-    lookup_cache[count].in_app_db = in_app_db;
-    lookup_cache[count].valid = true;
-    *cache_count = count + 1;
+static int compare_title_id_str(const void *a, const void *b) {
+  return strcmp((const char *)a, (const char *)b);
+}
+
+static bool app_db_title_list_contains(const struct AppDbTitleList *list,
+                                       const char *title_id) {
+  if (!list || !title_id || title_id[0] == '\0')
+    return false;
+  return bsearch(title_id, list->ids, (size_t)list->count, sizeof(*list->ids),
+                 compare_title_id_str) != NULL;
+}
+
+static bool load_app_db_title_list(struct AppDbTitleList *list) {
+  if (!list)
+    return false;
+  free_app_db_title_list(list);
+
+  const char *sql =
+      "SELECT DISTINCT titleId "
+      "FROM tbl_contentinfo "
+      "WHERE titleId != '' "
+      "ORDER BY titleId;";
+  sqlite3_stmt *stmt = NULL;
+  int prep_rc = app_db_prepare_with_retry(sql, &stmt, APP_DB_PREPARE_BUSY_RETRIES,
+                                          "title list query");
+  if (prep_rc != SQLITE_OK) {
+    close_app_db();
+    return false;
   }
-  return in_app_db ? 1 : 0;
+
+  int busy_attempts = 0;
+  while (!should_stop_requested()) {
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+      const char *title_id = (const char *)sqlite3_column_text(stmt, 0);
+      if (title_id && title_id[0] != '\0') {
+        if (!append_app_db_title(list, title_id)) {
+          log_debug("  [DB] title list allocation failed");
+          sqlite3_finalize(stmt);
+          close_app_db();
+          free_app_db_title_list(list);
+          return false;
+        }
+      }
+      continue;
+    }
+    if (rc == SQLITE_DONE) {
+      sqlite3_finalize(stmt);
+      close_app_db();
+      log_debug("  [DB] loaded app.db title list: %d entries", list->count);
+      return true;
+    }
+    if ((rc == SQLITE_BUSY || rc == SQLITE_LOCKED) &&
+        busy_attempts + 1 < APP_DB_QUERY_BUSY_RETRIES) {
+      busy_attempts++;
+      sceKernelUsleep(APP_DB_BUSY_RETRY_SLEEP_US);
+      continue;
+    }
+
+    log_debug("  [DB] title list query failed: rc=%d err=%s", rc,
+              (g_app_db ? sqlite3_errmsg(g_app_db) : "unknown"));
+    sqlite3_finalize(stmt);
+    close_app_db();
+    free_app_db_title_list(list);
+    return false;
+  }
+
+  sqlite3_finalize(stmt);
+  close_app_db();
+  free_app_db_title_list(list);
+  return false;
 }
 
 // --- FAST STABILITY CHECK ---
-static bool is_path_stable_now(const char *path, double *root_diff_out) {
+static bool is_path_stable_now(const char *path, double *root_diff_out,
+                               int *stat_errno_out) {
   struct stat st;
   time_t now = time(NULL);
-  if (stat(path, &st) != 0)
+  ensure_runtime_config_ready();
+  if (stat_errno_out)
+    *stat_errno_out = 0;
+  if (stat(path, &st) != 0) {
+    if (root_diff_out)
+      *root_diff_out = -1.0;
+    if (stat_errno_out)
+      *stat_errno_out = errno;
     return false;
+  }
 
   double root_diff = difftime(now, st.st_mtime);
   if (root_diff_out)
     *root_diff_out = root_diff;
   if (root_diff < 0.0)
     return true;
-  return root_diff > 10.0;
+  return root_diff > (double)g_runtime_cfg.stability_wait_seconds;
 }
 
 bool wait_for_stability_fast(const char *path, const char *name) {
   double diff = 0.0;
-  if (is_path_stable_now(path, &diff))
+  int st_err = 0;
+  if (is_path_stable_now(path, &diff, &st_err))
     return true;
 
-  log_debug("  [WAIT] %s modified %.0fs ago. Waiting...", name, diff);
+  if (st_err != 0) {
+    log_debug("  [WAIT] %s stat failed for %s: %s", name, path, strerror(st_err));
+  } else {
+    log_debug("  [WAIT] %s modified %.0fs ago. Waiting...", name, diff);
+  }
   sceKernelUsleep(2000000); // Wait 2s
   return false;             // Force re-scan next cycle
 }
 
 // --- Mount/Copy Helpers for Install Action ---
 static int copy_file(const char *src, const char *dst);
-
-static int remount_system_ex(void) {
-  struct iovec iov[] = {
-      IOVEC_ENTRY("from"),      IOVEC_ENTRY("/dev/ssd0.system_ex"),
-      IOVEC_ENTRY("fspath"),    IOVEC_ENTRY("/system_ex"),
-      IOVEC_ENTRY("fstype"),    IOVEC_ENTRY("exfatfs"),
-      IOVEC_ENTRY("large"),     IOVEC_ENTRY("yes"),
-      IOVEC_ENTRY("timezone"),  IOVEC_ENTRY("static"),
-      IOVEC_ENTRY("async"),     IOVEC_ENTRY(NULL),
-      IOVEC_ENTRY("ignoreacl"), IOVEC_ENTRY(NULL)};
-  return nmount(iov, IOVEC_SIZE(iov), MNT_UPDATE);
-}
-
-static int mount_nullfs(const char *src, const char *dst) {
-  struct iovec iov[] = {IOVEC_ENTRY("fstype"), IOVEC_ENTRY("nullfs"),
-                        IOVEC_ENTRY("from"),   IOVEC_ENTRY(src),
-                        IOVEC_ENTRY("fspath"), IOVEC_ENTRY(dst)};
-  return nmount(iov, IOVEC_SIZE(iov), MNT_RDONLY);
-}
-
-static bool unmount_nullfs_mount(const char *mount_point) {
-  if (unmount(mount_point, 0) == 0) {
-    invalidate_nullfs_mount(mount_point);
-    return true;
-  }
-
-  int err = errno;
-  if (err == ENOENT || err == EINVAL) {
-    invalidate_nullfs_mount(mount_point);
-    return true;
-  }
-
-  log_debug("  [MOUNT] unmount failed for %s: %s, trying force...",
-            mount_point, strerror(err));
-  if (unmount(mount_point, MNT_FORCE) == 0 || errno == ENOENT ||
-      errno == EINVAL) {
-    invalidate_nullfs_mount(mount_point);
-    return true;
-  }
-
-  log_debug("  [MOUNT] force unmount failed for %s: %s", mount_point,
-            strerror(errno));
-  return false;
-}
 
 static int copy_dir(const char *src, const char *dst) {
   if (mkdir(dst, 0777) != 0 && errno != EEXIST)
@@ -1507,13 +1368,14 @@ static bool wait_for_dev_node_state(const char *devname, bool should_exist) {
 static bool is_source_stable_for_mount(const char *path, const char *name,
                                        const char *tag) {
   struct stat st;
+  ensure_runtime_config_ready();
   if (stat(path, &st) != 0)
     return false;
 
   double age = difftime(time(NULL), st.st_mtime);
   if (age < 0.0)
     return true;
-  if (age < 10.0) {
+  if (age < (double)g_runtime_cfg.stability_wait_seconds) {
     log_debug("  [%s] %s modified %.0fs ago, waiting...", tag, name, age);
     return false;
   }
@@ -1525,6 +1387,8 @@ static void init_runtime_config_defaults(void) {
   g_runtime_cfg.debug_enabled = true;
   g_runtime_cfg.mount_read_only = (IMAGE_MOUNT_READ_ONLY != 0);
   g_runtime_cfg.recursive_scan = false;
+  g_runtime_cfg.scan_interval_us = DEFAULT_SCAN_INTERVAL_US;
+  g_runtime_cfg.stability_wait_seconds = DEFAULT_STABILITY_WAIT_SECONDS;
   g_runtime_cfg.exfat_backend = DEFAULT_EXFAT_BACKEND;
   g_runtime_cfg.ufs_backend = DEFAULT_UFS_BACKEND;
   g_runtime_cfg.lvd_sector_exfat = LVD_SECTOR_SIZE_EXFAT;
@@ -1683,6 +1547,30 @@ static bool load_runtime_config(void) {
       continue;
     }
 
+    if (strcasecmp(key, "scan_interval_seconds") == 0 ||
+        strcasecmp(key, "scan_interval_sec") == 0) {
+      if (!parse_u32_ini(value, &u32) || u32 < MIN_SCAN_INTERVAL_SECONDS ||
+          u32 > MAX_SCAN_INTERVAL_SECONDS) {
+        log_debug("  [CFG] invalid scan interval at line %d: %s=%s (range: %u..%u)",
+                  line_no, key, value, (unsigned)MIN_SCAN_INTERVAL_SECONDS,
+                  (unsigned)MAX_SCAN_INTERVAL_SECONDS);
+        continue;
+      }
+      g_runtime_cfg.scan_interval_us = u32 * 1000000u;
+      continue;
+    }
+
+    if (strcasecmp(key, "stability_wait_seconds") == 0 ||
+        strcasecmp(key, "stability_wait_sec") == 0) {
+      if (!parse_u32_ini(value, &u32) || u32 > MAX_STABILITY_WAIT_SECONDS) {
+        log_debug("  [CFG] invalid stability wait at line %d: %s=%s (max: %u)",
+                  line_no, key, value, (unsigned)MAX_STABILITY_WAIT_SECONDS);
+        continue;
+      }
+      g_runtime_cfg.stability_wait_seconds = u32;
+      continue;
+    }
+
     if (strcasecmp(key, "exfat_backend") == 0) {
       if (!parse_backend_ini(value, &backend)) {
         log_debug("  [CFG] invalid backend at line %d: %s=%s", line_no, key,
@@ -1758,7 +1646,7 @@ static bool load_runtime_config(void) {
   log_debug("  [CFG] loaded: debug=%d ro=%d recursive_scan=%d "
             "exfat_backend=%s ufs_backend=%s "
             "lvd_sec(exfat=%u ufs=%u pfs=%u) md_sec(exfat=%u ufs=%u) "
-            "scan_paths=%d",
+            "scan_interval_s=%u stability_wait_s=%u scan_paths=%d",
             g_runtime_cfg.debug_enabled ? 1 : 0,
             g_runtime_cfg.mount_read_only ? 1 : 0,
             g_runtime_cfg.recursive_scan ? 1 : 0,
@@ -1766,7 +1654,8 @@ static bool load_runtime_config(void) {
             backend_name(g_runtime_cfg.ufs_backend),
             g_runtime_cfg.lvd_sector_exfat, g_runtime_cfg.lvd_sector_ufs,
             g_runtime_cfg.lvd_sector_pfs, g_runtime_cfg.md_sector_exfat,
-            g_runtime_cfg.md_sector_ufs, g_scan_path_count);
+            g_runtime_cfg.md_sector_ufs, g_runtime_cfg.scan_interval_us / 1000000u,
+            g_runtime_cfg.stability_wait_seconds, g_scan_path_count);
 
   return true;
 }
@@ -1807,13 +1696,13 @@ static uint16_t get_lvd_attach_option(image_fs_type_t fs_type,
                                       bool mount_read_only) {
   if (fs_type == IMAGE_FS_UFS) {
     // UFS runtime mapping: RO -> 0x1E, RW -> 0x16.
-    return mount_read_only ? LVD_ATTACH_OPTION_NORM_DD_RW
-                           : LVD_ATTACH_OPTION_NORM_DD_RO;
+    return mount_read_only ? LVD_ATTACH_OPTION_NORM_DD_RO
+                           : LVD_ATTACH_OPTION_NORM_DD_RW;
   }
 
   // Generic/PFS runtime mapping: RO -> 0x9, RW -> 0x8.
-  return mount_read_only ? LVD_ATTACH_OPTION_FLAGS_RW
-                         : LVD_ATTACH_OPTION_FLAGS_DEFAULT;
+  return mount_read_only ? LVD_ATTACH_OPTION_FLAGS_DEFAULT
+                         : LVD_ATTACH_OPTION_FLAGS_RW;
 }
 
 static unsigned int get_nmount_flags(image_fs_type_t fs_type,
@@ -2522,15 +2411,6 @@ static void shutdown_ufs_mounts(void) {
   }
 }
 
-static void shutdown_nullfs_mounts(void) {
-  for (int k = 0; k < MAX_NULLFS_MOUNTS; k++) {
-    if (!nullfs_cache[k].valid)
-      continue;
-    unmount_nullfs_mount(nullfs_cache[k].mount_point);
-    nullfs_cache[k].valid = false;
-  }
-}
-
 // --- Game Metadata Parsing (param.json) ---
 static int extract_json_string(const char *json, const char *key, char *out,
                                size_t out_size) {
@@ -2662,14 +2542,11 @@ static void prune_game_cache(void) {
     if (access(cache[k].path, F_OK) == 0)
       continue;
 
-    if (cache[k].title_id[0] != '\0') {
-      char mount_point[MAX_PATH];
-      build_system_ex_app_path(cache[k].title_id, mount_point, sizeof(mount_point));
-      if (unmount_nullfs_mount(mount_point)) {
-        log_debug("  [MOUNT] source removed, unmounted: %s (%s)",
-                  cache[k].title_id, cache[k].path);
-      }
-    }
+    if (cache[k].title_id[0] != '\0')
+      log_debug("  [CACHE] source removed: %s (%s)", cache[k].title_id,
+                cache[k].path);
+    else
+      log_debug("  [CACHE] source removed: %s", cache[k].path);
 
     cache[k].valid = false;
     cache[k].path[0] = '\0';
@@ -2725,8 +2602,8 @@ static bool is_under_discovered_param_root(
 // --- Candidate Discovery ---
 static bool try_collect_candidate_for_directory(
     const char *full_path, scan_candidate_t *candidates, int max_candidates,
-    int *candidate_count, struct AppDbLookupCache *db_cache,
-    int *db_cache_count, char discovered_param_roots[][MAX_PATH],
+    int *candidate_count, const struct AppDbTitleList *app_db_titles,
+    bool app_db_titles_ready, char discovered_param_roots[][MAX_PATH],
     int *discovered_param_root_count) {
   struct stat param_st;
   memset(&param_st, 0, sizeof(param_st));
@@ -2782,14 +2659,12 @@ static bool try_collect_candidate_for_directory(
     }
   }
 
-  int in_app_db_q = lookup_title_in_app_db_cached(title_id, db_cache, db_cache_count);
-  if (in_app_db_q < 0) {
-    // app.db is busy/locked right now; defer install/remount decisions to a later scan.
+  if (!app_db_titles_ready) {
     log_debug("  [SKIP] app.db unavailable (locked/busy), deferring: %s (%s)",
               title_name, title_id);
     return true;
   }
-  bool in_app_db = (in_app_db_q != 0);
+  bool in_app_db = app_db_title_list_contains(app_db_titles, title_id);
 
   if (in_app_db) {
     for (int k = 0; k < MAX_PENDING; k++) {
@@ -2817,8 +2692,13 @@ static bool try_collect_candidate_for_directory(
   // Installed status requires both app files and app.db presence.
   bool installed = is_installed(title_id) && in_app_db;
   bool mounted = is_data_mounted(title_id);
-  if (installed && mounted && mount_link_matches_system_ex(title_id)) {
-    log_debug("  [SKIP] already installed+mounted: %s (%s)", title_name, title_id);
+  if (installed && mount_link_matches_source(title_id, full_path)) {
+    if (mounted)
+      log_debug("  [SKIP] already installed+mounted+linked: %s (%s)", title_name,
+                title_id);
+    else
+      log_debug("  [SKIP] already installed+linked (waiting kstuff mount): %s (%s)",
+                title_name, title_id);
     return true;
   }
 
@@ -2855,8 +2735,8 @@ static bool try_collect_candidate_for_directory(
 
 static void collect_candidates_recursively(
     const char *dir_path, scan_candidate_t *candidates, int max_candidates,
-    int *candidate_count, struct AppDbLookupCache *db_cache,
-    int *db_cache_count, char discovered_param_roots[][MAX_PATH],
+    int *candidate_count, const struct AppDbTitleList *app_db_titles,
+    bool app_db_titles_ready, char discovered_param_roots[][MAX_PATH],
     int *discovered_param_root_count) {
   if (should_stop_requested() || !dir_path || dir_path[0] == '\0')
     return;
@@ -2864,8 +2744,9 @@ static void collect_candidates_recursively(
   // Once a directory has sce_sys/param.json (valid or not),
   // it is treated as a terminal game root and descendants are skipped.
   if (try_collect_candidate_for_directory(
-          dir_path, candidates, max_candidates, candidate_count, db_cache,
-          db_cache_count, discovered_param_roots, discovered_param_root_count)) {
+          dir_path, candidates, max_candidates, candidate_count, app_db_titles,
+          app_db_titles_ready, discovered_param_roots,
+          discovered_param_root_count)) {
     return;
   }
 
@@ -2896,8 +2777,8 @@ static void collect_candidates_recursively(
       continue;
 
     collect_candidates_recursively(
-        full_path, candidates, max_candidates, candidate_count, db_cache,
-        db_cache_count, discovered_param_roots, discovered_param_root_count);
+        full_path, candidates, max_candidates, candidate_count, app_db_titles,
+        app_db_titles_ready, discovered_param_roots, discovered_param_root_count);
   }
 
   closedir(d);
@@ -2905,9 +2786,9 @@ static void collect_candidates_recursively(
 
 // --- Unified Scan Pass (images + game candidates) ---
 static void cleanup_lost_sources_before_scan(void) {
-  // 1) Remove stale nullfs mounts for deleted game sources.
+  // 1) Drop stale game cache entries for deleted sources.
   prune_game_cache();
-  // 2) After nullfs cleanup, stale image unmounts are less likely to be busy.
+  // 2) Unmount stale image mounts for deleted image files.
   cleanup_stale_image_mounts();
   // 3) Drop stale path-state entries.
   prune_path_state();
@@ -2916,12 +2797,15 @@ static void cleanup_lost_sources_before_scan(void) {
 static int collect_scan_candidates(scan_candidate_t *candidates,
                                    int max_candidates) {
   int candidate_count = 0;
-  struct AppDbLookupCache *db_cache = g_scan_db_lookup_cache;
-  int db_cache_count = 0;
+  struct AppDbTitleList app_db_titles = {0};
+  bool app_db_titles_ready = load_app_db_title_list(&app_db_titles);
   char (*discovered_param_roots)[MAX_PATH] = g_scan_discovered_param_roots;
   int discovered_param_root_count = 0;
-  memset(db_cache, 0, sizeof(g_scan_db_lookup_cache));
   memset(discovered_param_roots, 0, sizeof(g_scan_discovered_param_roots));
+
+  if (!app_db_titles_ready) {
+    log_debug("  [DB] app.db title list unavailable for this scan cycle");
+  }
 
   for (int i = 0; SCAN_PATHS[i] != NULL; i++) {
     if (should_stop_requested())
@@ -2966,20 +2850,20 @@ static int collect_scan_candidates(scan_candidate_t *candidates,
 
       if (g_runtime_cfg.recursive_scan) {
         collect_candidates_recursively(
-            full_path, candidates, max_candidates, &candidate_count, db_cache,
-            &db_cache_count, discovered_param_roots,
+            full_path, candidates, max_candidates, &candidate_count,
+            &app_db_titles, app_db_titles_ready, discovered_param_roots,
             &discovered_param_root_count);
       } else {
         (void)try_collect_candidate_for_directory(
-            full_path, candidates, max_candidates, &candidate_count, db_cache,
-            &db_cache_count, discovered_param_roots,
+            full_path, candidates, max_candidates, &candidate_count,
+            &app_db_titles, app_db_titles_ready, discovered_param_roots,
             &discovered_param_root_count);
       }
     }
     closedir(d);
   }
 done:
-  // Keep app.db open only during a single scan cycle.
+  free_app_db_title_list(&app_db_titles);
   close_app_db();
   return candidate_count;
 }
@@ -2988,31 +2872,9 @@ done:
 bool mount_and_install(const char *src_path, const char *title_id,
                        const char *title_name, bool is_remount,
                        bool should_register) {
-  char system_ex_app[MAX_PATH];
   char user_app_dir[MAX_PATH];
   char user_sce_sys[MAX_PATH];
   char src_sce_sys[MAX_PATH];
-  bool nullfs_mounted = false;
-
-  // MOUNT
-  build_system_ex_app_path(title_id, system_ex_app, sizeof(system_ex_app));
-  mkdir(system_ex_app, 0777);
-  if (unmount(system_ex_app, 0) != 0 && errno != ENOENT && errno != EINVAL) {
-    log_debug("  [MOUNT] pre-unmount failed for %s: %s, trying force...",
-              system_ex_app, strerror(errno));
-    if (unmount(system_ex_app, MNT_FORCE) != 0 && errno != ENOENT &&
-        errno != EINVAL) {
-      log_debug("  [MOUNT] pre-force-unmount failed for %s: %s", system_ex_app,
-                strerror(errno));
-      return false;
-    }
-  }
-  if (mount_nullfs(src_path, system_ex_app) < 0) {
-    log_debug("  [MOUNT] FAIL: %s", strerror(errno));
-    return false;
-  }
-  nullfs_mounted = true;
-  cache_nullfs_mount(system_ex_app);
 
   // COPY FILES
   if (!is_remount) {
@@ -3025,8 +2887,6 @@ bool mount_and_install(const char *src_path, const char *title_id,
     if (copy_dir(src_sce_sys, user_sce_sys) != 0) {
       log_debug("  [COPY] Failed to copy sce_sys: %s -> %s", src_sce_sys,
                 user_sce_sys);
-      if (nullfs_mounted)
-        unmount_nullfs_mount(system_ex_app);
       return false;
     }
 
@@ -3035,8 +2895,6 @@ bool mount_and_install(const char *src_path, const char *title_id,
     snprintf(icon_dst, sizeof(icon_dst), "/user/app/%s/icon0.png", title_id);
     if (copy_file(icon_src, icon_dst) != 0) {
       log_debug("  [COPY] Failed to copy icon: %s -> %s", icon_src, icon_dst);
-      if (nullfs_mounted)
-        unmount_nullfs_mount(system_ex_app);
       return false;
     }
   } else {
@@ -3049,7 +2907,7 @@ bool mount_and_install(const char *src_path, const char *title_id,
   bool link_ok = false;
   FILE *flnk = fopen(lnk_path, "w");
   if (flnk) {
-    bool write_ok = (fprintf(flnk, "%s", system_ex_app) >= 0);
+    bool write_ok = (fprintf(flnk, "%s", src_path) >= 0);
     bool flush_ok = (fflush(flnk) == 0);
     bool close_ok = (fclose(flnk) == 0);
     if (write_ok && flush_ok && close_ok) {
@@ -3061,8 +2919,6 @@ bool mount_and_install(const char *src_path, const char *title_id,
     log_debug("  [LINK] open failed for %s: %s", lnk_path, strerror(errno));
   }
   if (!link_ok) {
-    if (nullfs_mounted)
-      unmount_nullfs_mount(system_ex_app);
     return false;
   }
 
@@ -3100,8 +2956,6 @@ bool mount_and_install(const char *src_path, const char *title_id,
     log_debug("  [REG] FAIL: 0x%x", res);
     notify_system("Register failed: %s (%s)\ncode=0x%08X", title_name, title_id,
                   (uint32_t)res);
-    if (nullfs_mounted)
-      unmount_nullfs_mount(system_ex_app);
     return false;
   }
   return true;
@@ -3110,11 +2964,6 @@ bool mount_and_install(const char *src_path, const char *title_id,
 // --- Execution (per discovered candidate) ---
 static void process_scan_candidates(const scan_candidate_t *candidates,
                                     int candidate_count) {
-  if (remount_system_ex() != 0) {
-    log_debug("  [MOUNT] remount_system_ex failed: %s", strerror(errno));
-    return;
-  }
-
   for (int i = 0; i < candidate_count; i++) {
     if (should_stop_requested())
       return;
@@ -3223,7 +3072,6 @@ int main(void) {
     notify_system("ShadowMount+: Recursive scan enabled.");
 
   cleanup_mount_dirs();
-  (void)init_app_triggers();
 
   // --- STARTUP LOGIC ---
   cleanup_lost_sources_before_scan();
@@ -3248,7 +3096,7 @@ int main(void) {
 
     // Sleep FIRST since we either just finished scan above, or library was
     // ready.
-    if (sleep_with_stop_check(SCAN_INTERVAL_US)) {
+    if (sleep_with_stop_check(g_runtime_cfg.scan_interval_us)) {
       log_debug("[SHUTDOWN] stop requested during sleep");
       break;
     }
@@ -3256,7 +3104,6 @@ int main(void) {
     scan_all_paths();
   }
 
-  shutdown_nullfs_mounts();
   shutdown_ufs_mounts();
   close_app_db();
   if (lock >= 0) {

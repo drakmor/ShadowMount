@@ -88,9 +88,9 @@ function Find-OSFMountCom {
   if ($cmd) { return $cmd.Source }
 
   $candidates = @(
-    "$env:ProgramFiles\OSFMount\osfmount.com",
+    "${env:ProgramFiles}\OSFMount\osfmount.com",
     "${env:ProgramFiles(x86)}\OSFMount\osfmount.com",
-    "$env:ProgramFiles\PassMark\OSFMount\osfmount.com",
+    "${env:ProgramFiles}\PassMark\OSFMount\osfmount.com",
     "${env:ProgramFiles(x86)}\PassMark\OSFMount\osfmount.com"
   ) | Where-Object { $_ -and (Test-Path $_) }
 

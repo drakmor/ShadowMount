@@ -19,6 +19,13 @@ mount_read_only=1
 # 0/false/no/off -> scan only first-level subdirectories (default)
 recursive_scan=0
 
+# Full scan loop interval (seconds), range: 1..3600
+scan_interval_seconds=10
+
+# Source stabilization wait window (seconds), range: 0..3600
+# If source mtime is newer than this window, it will be deferred to next scan.
+stability_wait_seconds=10
+
 # Backend selection per filesystem:
 # lvd   -> /dev/lvdctl -> /dev/lvdN
 # md    -> /dev/mdctl  -> /dev/mdN

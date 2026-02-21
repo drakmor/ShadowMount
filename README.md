@@ -1,6 +1,6 @@
 # ShadowMountPlus (PS5)
 
-**Version:** `1.5beta3`
+**Version:** `1.5beta4`
 
 **Repository:** https://github.com/drakmor/shadowMountPlus
 
@@ -39,6 +39,8 @@ Supported keys (all optional):
 - `debug=1|0` (`1` enables `log_debug` output to console + `/data/shadowmount/debug.log`; default is `1`)
 - `mount_read_only=1|0` (default: `1`)
 - `recursive_scan=1|0` (`0` = scan only first-level subfolders, `1` = recursive scan without depth limit; default: `0`)
+- `scan_interval_seconds=<1..3600>` (full scan loop interval; default: `10`)
+- `stability_wait_seconds=<0..3600>` (minimum source age before processing; default: `10`)
 - `exfat_backend=lvd|md` (default: `lvd`)
 - `ufs_backend=lvd|md` (default: `lvd`)
 - `scanpath=<absolute_path>` (can be repeated on multiple lines; default: built-in scan path list below)
@@ -53,7 +55,8 @@ Scan path behavior:
 - `/data/ufsmnt` is always added automatically, even with custom paths.
 - With `recursive_scan=0` (default), only first-level subfolders are checked.
 - With `recursive_scan=1`, subfolders are scanned recursively.
-- Full scan loop runs every 10 seconds.
+- Full scan loop runs every `scan_interval_seconds` (default: `10`).
+- Sources newer than `stability_wait_seconds` are deferred until stable (default: `10`).
 
 Validation:
 - See `config.ini.example` for a ready-to-use template.
@@ -189,6 +192,7 @@ If a game is not mounted:
 - Verify scan depth:
   - `recursive_scan=0` scans only first-level subfolders;
   - `recursive_scan=1` scans recursively.
+- If logs show `source not stable yet`, adjust `stability_wait_seconds` (or wait for source copy/write to finish).
 - Verify game structure:
   - folder game: `<GAME_DIR>/sce_sys/param.json`;
   - image game (`.ffpkg` / `.exfat` / `.ffpfs`): `sce_sys/param.json` must be at image root (no extra top-level folder).
