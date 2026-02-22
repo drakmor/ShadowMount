@@ -50,10 +50,11 @@
 #define MAX_PATH 1024
 #define MAX_TITLE_ID 32
 #define MAX_TITLE_NAME 256
-#define SHADOWMOUNT_VERSION "1.5beta3"
+#define SHADOWMOUNT_VERSION "1.5beta5"
 #define UFS_MOUNT_BASE "/data/ufsmnt"
 #define LOG_DIR "/data/shadowmount"
 #define LOG_FILE "/data/shadowmount/debug.log"
+#define LOG_FILE_PREV "/data/shadowmount/debug.log.1"
 #define CONFIG_FILE "/data/shadowmount/config.ini"
 #define LOCK_FILE "/data/shadowmount/daemon.lock"
 #define KILL_FILE "/data/shadowmount/STOP"
@@ -943,15 +944,104 @@ static bool read_mount_link(const char *title_id, char *out, size_t out_size) {
   return out[0] != '\0';
 }
 
-static bool mount_link_matches_source(const char *title_id,
-                                      const char *source_path) {
-  if (!source_path || source_path[0] == '\0')
+static bool path_matches_root_or_child(const char *path, const char *root) {
+  if (!path || !root || root[0] == '\0')
     return false;
+  size_t root_len = strlen(root);
+  if (strncmp(path, root, root_len) != 0)
+    return false;
+  return (path[root_len] == '\0' || path[root_len] == '/');
+}
 
-  char tracked_path[MAX_PATH];
-  if (!read_mount_link(title_id, tracked_path, sizeof(tracked_path)))
-    return false;
-  return strcmp(tracked_path, source_path) == 0;
+static void cleanup_mount_links(const char *removed_source_root,
+                                bool unmount_system_ex_bind) {
+  DIR *d = opendir("/user/app");
+  if (!d) {
+    if (errno != ENOENT)
+      log_debug("  [LINK] open /user/app failed: %s", strerror(errno));
+    return;
+  }
+
+  struct dirent *entry;
+  while ((entry = readdir(d)) != NULL) {
+    if (should_stop_requested())
+      break;
+    if (entry->d_name[0] == '.')
+      continue;
+    if (strlen(entry->d_name) != 9)
+      continue;
+
+    char app_dir[MAX_PATH];
+    snprintf(app_dir, sizeof(app_dir), "/user/app/%s", entry->d_name);
+    if (entry->d_type == DT_DIR) {
+      // ok
+    } else if (entry->d_type == DT_UNKNOWN) {
+      struct stat st;
+      if (stat(app_dir, &st) != 0 || !S_ISDIR(st.st_mode))
+        continue;
+    } else {
+      continue;
+    }
+
+    char lnk_path[MAX_PATH];
+    snprintf(lnk_path, sizeof(lnk_path), "%s/mount.lnk", app_dir);
+    struct stat lst;
+    if (stat(lnk_path, &lst) != 0 || !S_ISREG(lst.st_mode))
+      continue;
+
+    char source_path[MAX_PATH];
+    bool should_remove = false;
+    bool matches_removed_source = false;
+    if (!read_mount_link(entry->d_name, source_path, sizeof(source_path))) {
+      should_remove = true;
+    } else if (removed_source_root && removed_source_root[0] != '\0') {
+      matches_removed_source =
+          path_matches_root_or_child(source_path, removed_source_root);
+      should_remove = matches_removed_source;
+    } else {
+      if (access(source_path, F_OK) != 0) {
+        should_remove = true;
+      } else if (path_matches_root_or_child(source_path, "/system_ex/app")) {
+        should_remove = true;
+      } else {
+        char eboot_path[MAX_PATH];
+        snprintf(eboot_path, sizeof(eboot_path), "%s/eboot.bin", source_path);
+        if (access(eboot_path, F_OK) != 0)
+          should_remove = true;
+      }
+    }
+
+    if (!should_remove)
+      continue;
+
+    if (unlink(lnk_path) == 0 || errno == ENOENT) {
+      log_debug("  [LINK] removed stale mount link: %s", lnk_path);
+    } else {
+      log_debug("  [LINK] remove failed for %s: %s", lnk_path, strerror(errno));
+    }
+
+    if (unmount_system_ex_bind && matches_removed_source) {
+      char system_ex_path[MAX_PATH];
+      snprintf(system_ex_path, sizeof(system_ex_path), "/system_ex/app/%s",
+               entry->d_name);
+
+      struct statfs mount_st;
+      if (statfs(system_ex_path, &mount_st) == 0 &&
+          strcmp(mount_st.f_fstypename, "nullfs") == 0 &&
+          path_matches_root_or_child(mount_st.f_mntfromname, removed_source_root)) {
+        if (unmount(system_ex_path, 0) != 0 && errno != ENOENT &&
+            errno != EINVAL) {
+          if (unmount(system_ex_path, MNT_FORCE) != 0 && errno != ENOENT &&
+              errno != EINVAL) {
+            log_debug("  [LINK] unmount failed for %s: %s", system_ex_path,
+                      strerror(errno));
+          }
+        }
+      }
+    }
+  }
+
+  closedir(d);
 }
 
 // --- app.db Access Layer ---
@@ -1356,8 +1446,7 @@ static int copy_file(const char *src, const char *dst) {
 // --- Device Node Wait and Source Stability ---
 static bool wait_for_dev_node_state(const char *devname, bool should_exist) {
   for (int i = 0; i < LVD_NODE_WAIT_RETRIES; i++) {
-    bool exists = (access(devname, F_OK) == 0);
-    if (exists == should_exist)
+    if ((access(devname, F_OK) == 0) == should_exist)
       return true;
     sceKernelUsleep(LVD_NODE_WAIT_US);
   }
@@ -1967,7 +2056,6 @@ static bool unmount_ufs_image(const char *file_path, int unit_id,
   build_ufs_mount_point(file_path, fs_type, mount_point, sizeof(mount_point));
   int resolved_unit = unit_id;
   attach_backend_t resolved_backend = backend;
-  bool can_detach = true;
 
   if (resolved_unit < 0 || resolved_backend == ATTACH_BACKEND_NONE) {
     if (!resolve_device_from_mount(mount_point, &resolved_backend,
@@ -1977,21 +2065,20 @@ static bool unmount_ufs_image(const char *file_path, int unit_id,
     }
   }
 
+  // Remove mount.lnk and unmount /system_ex/app/<titleid> that point to this
+  // source before unmounting the virtual disk itself.
+  cleanup_mount_links(mount_point, true);
+
   // Try standard unmount
   if (unmount(mount_point, 0) != 0) {
-    int unmount_err = errno;
-    if (unmount_err != ENOENT && unmount_err != EINVAL) {
-      if (unmount(mount_point, MNT_FORCE) != 0 && errno != ENOENT &&
-          errno != EINVAL) {
-        log_debug("  [IMG][%s] unmount failed for %s: %s",
-                  backend_name(resolved_backend), mount_point, strerror(errno));
-        can_detach = false;
-      }
+    if (errno != ENOENT && errno != EINVAL &&
+        unmount(mount_point, MNT_FORCE) != 0 && errno != ENOENT &&
+        errno != EINVAL) {
+      log_debug("  [IMG][%s] unmount failed for %s: %s",
+                backend_name(resolved_backend), mount_point, strerror(errno));
+      return false;
     }
   }
-
-  if (!can_detach)
-    return false;
 
   bool detach_ok = true;
   if (resolved_backend != ATTACH_BACKEND_NONE && resolved_unit >= 0)
@@ -2333,6 +2420,45 @@ static void cleanup_stale_image_mounts(void) {
                             ufs_cache[k].backend)) {
         ufs_cache[k].valid = false;
       }
+      continue;
+    }
+
+    if (!ufs_cache[k].valid)
+      continue;
+
+    image_fs_type_t fs_type = detect_image_fs_type(ufs_cache[k].path);
+
+    char mount_point[MAX_PATH];
+    build_ufs_mount_point(ufs_cache[k].path, fs_type, mount_point,
+                          sizeof(mount_point));
+    if (is_active_image_mount_point(mount_point))
+      continue;
+
+    char source_path[MAX_PATH];
+    (void)strlcpy(source_path, ufs_cache[k].path, sizeof(source_path));
+    log_debug("  [IMG][%s] mount lost, retrying: %s -> %s",
+              backend_name(ufs_cache[k].backend), source_path, mount_point);
+
+    for (int i = 0; i < MAX_PENDING; i++) {
+      if (!cache[i].valid || strcmp(cache[i].path, mount_point) != 0)
+        continue;
+      cache[i].valid = false;
+      cache[i].path[0] = '\0';
+      cache[i].title_id[0] = '\0';
+      cache[i].title_name[0] = '\0';
+    }
+    clear_missing_param_entry(mount_point);
+
+    ufs_cache[k].valid = false;
+    if (mount_ufs_image(source_path, fs_type)) {
+      clear_image_mount_attempts(source_path);
+      continue;
+    }
+
+    int mount_err = errno;
+    if (bump_image_mount_attempts(source_path) == 1) {
+      notify_system("Image mount failed: 0x%08X\n%s", (uint32_t)mount_err,
+                    source_path);
     }
   }
 }
@@ -2393,8 +2519,7 @@ static void maybe_mount_image_file(const char *full_path,
     clear_image_mount_attempts(full_path);
   else {
     int mount_err = errno;
-    uint8_t attempts = bump_image_mount_attempts(full_path);
-    if (attempts == 1) {
+    if (bump_image_mount_attempts(full_path) == 1) {
       notify_system("Image mount failed: 0x%08X\n%s",
                     (uint32_t)mount_err, full_path);
     }
@@ -2564,18 +2689,18 @@ static bool directory_has_param_json(const char *dir_path,
   if (dir_fd < 0)
     return false;
 
-  bool ok = false;
   struct stat st;
   if (fstatat(dir_fd, "sce_sys", &st, 0) == 0 && S_ISDIR(st.st_mode) &&
       fstatat(dir_fd, "sce_sys/param.json", &st, 0) == 0 &&
       S_ISREG(st.st_mode)) {
-    ok = true;
     if (param_st_out)
       *param_st_out = st;
+    close(dir_fd);
+    return true;
   }
 
   close(dir_fd);
-  return ok;
+  return false;
 }
 
 static bool is_under_discovered_param_root(
@@ -2592,8 +2717,7 @@ static bool is_under_discovered_param_root(
       continue;
     if (strncmp(path, root, root_len) != 0)
       continue;
-    char tail = path[root_len];
-    if (tail == '\0' || tail == '/')
+    if (path[root_len] == '\0' || path[root_len] == '/')
       return true;
   }
   return false;
@@ -2691,9 +2815,11 @@ static bool try_collect_candidate_for_directory(
 
   // Installed status requires both app files and app.db presence.
   bool installed = is_installed(title_id) && in_app_db;
-  bool mounted = is_data_mounted(title_id);
-  if (installed && mount_link_matches_source(title_id, full_path)) {
-    if (mounted)
+  char tracked_path[MAX_PATH];
+  if (installed &&
+      read_mount_link(title_id, tracked_path, sizeof(tracked_path)) &&
+      strcmp(tracked_path, full_path) == 0) {
+    if (is_data_mounted(title_id))
       log_debug("  [SKIP] already installed+mounted+linked: %s (%s)", title_name,
                 title_id);
     else
@@ -2788,14 +2914,17 @@ static void collect_candidates_recursively(
 static void cleanup_lost_sources_before_scan(void) {
   // 1) Drop stale game cache entries for deleted sources.
   prune_game_cache();
-  // 2) Unmount stale image mounts for deleted image files.
+  // 2) Drop stale/broken mount links.
+  cleanup_mount_links(NULL, false);
+  // 3) Unmount stale image mounts for deleted image files.
   cleanup_stale_image_mounts();
-  // 3) Drop stale path-state entries.
+  // 4) Drop stale path-state entries.
   prune_path_state();
 }
 
 static int collect_scan_candidates(scan_candidate_t *candidates,
-                                   int max_candidates) {
+                                   int max_candidates,
+                                   int *total_found_out) {
   int candidate_count = 0;
   struct AppDbTitleList app_db_titles = {0};
   bool app_db_titles_ready = load_app_db_title_list(&app_db_titles);
@@ -2863,6 +2992,8 @@ static int collect_scan_candidates(scan_candidate_t *candidates,
     closedir(d);
   }
 done:
+  if (total_found_out)
+    *total_found_out = discovered_param_root_count;
   free_app_db_title_list(&app_db_titles);
   close_app_db();
   return candidate_count;
@@ -2969,19 +3100,16 @@ static void process_scan_candidates(const scan_candidate_t *candidates,
       return;
 
     const scan_candidate_t *c = &candidates[i];
-    bool is_remount = c->installed;
-    bool should_register = !c->in_app_db;
 
-    if (is_remount) {
+    if (c->installed) {
       log_debug("  [ACTION] Remounting: %s", c->title_name);
     } else {
       log_debug("  [ACTION] Installing: %s (%s)", c->title_name, c->title_id);
       notify_system("Installing: %s (%s)...", c->title_name, c->title_id);
     }
 
-    bool ok = mount_and_install(c->path, c->title_id, c->title_name, is_remount,
-                                should_register);
-    if (ok) {
+    if (mount_and_install(c->path, c->title_id, c->title_name, c->installed,
+                          !c->in_app_db)) {
       clear_failed_mount_attempts(c->title_id);
       cache_game_entry(c->path, c->title_id, c->title_name);
     } else {
@@ -2998,7 +3126,8 @@ static void process_scan_candidates(const scan_candidate_t *candidates,
 // --- Scan Orchestration ---
 static int scan_all_paths_once(bool execute_actions) {
   cleanup_lost_sources_before_scan();
-  int candidate_count = collect_scan_candidates(g_scan_candidates, MAX_PENDING);
+  int candidate_count =
+      collect_scan_candidates(g_scan_candidates, MAX_PENDING, NULL);
   if (execute_actions && candidate_count > 0)
     process_scan_candidates(g_scan_candidates, candidate_count);
   return candidate_count;
@@ -3038,9 +3167,10 @@ int main(void) {
     return 1;
   }
 
-  remove(LOG_FILE);
+  (void)unlink(LOG_FILE_PREV);
+  (void)rename(LOG_FILE, LOG_FILE_PREV);
 
-  log_debug("SHADOWMOUNT+ v%s START exFAT/UFS/LVD/MD. Thx to VoidWhisper/Gezine/Earthonion/EchoStretch/Drakmor", SHADOWMOUNT_VERSION);
+  log_debug("SHADOWMOUNT+ v%s exFAT/UFS/LVD/MD. Thx to VoidWhisper/Gezine/Earthonion/EchoStretch/Drakmor", SHADOWMOUNT_VERSION);
   notify_system("ShadowMount+ v%s exFAT/UFS",
                   SHADOWMOUNT_VERSION);
 
@@ -3075,16 +3205,23 @@ int main(void) {
 
   // --- STARTUP LOGIC ---
   cleanup_lost_sources_before_scan();
-  int new_games = collect_scan_candidates(g_scan_candidates, MAX_PENDING);
+  int total_found_games = 0;
+  int new_games = collect_scan_candidates(g_scan_candidates, MAX_PENDING,
+                                          &total_found_games);
+  int notify_games = 0;
+  for (int i = 0; i < new_games; i++) {
+    if (!g_scan_candidates[i].installed)
+      notify_games++;
+  }
 
   if (new_games) {
-    // SCENARIO B: Work needed.
-    notify_system("Found %d Games. Executing...",
-                  new_games);
+    if (notify_games > 0) {
+      notify_system("Found %d new games. Executing...", notify_games);
+    }
     process_scan_candidates(g_scan_candidates, new_games);
 
     // Completion Message
-    notify_system("Library Synchronized.");
+    notify_system("Library Synchronized. Found %d games.", total_found_games);
   }
 
   // --- DAEMON LOOP ---

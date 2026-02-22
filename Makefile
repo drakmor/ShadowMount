@@ -16,6 +16,7 @@ all: shadowmountplus.elf
 # Build Daemon
 shadowmountplus.elf: src/main.c
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIBS)
+	$(PS5_PAYLOAD_SDK)/bin/prospero-strip --strip-debug $@
 
 clean:
 	rm -f shadowmountplus.elf kill.elf src/*.o
