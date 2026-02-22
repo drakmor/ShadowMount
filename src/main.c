@@ -871,7 +871,7 @@ void log_to_file(const char *fmt, va_list args) {
   }
 }
 void log_debug(const char *fmt, ...) {
-  if (!g_runtime_cfg_ready || !g_runtime_cfg.debug_enabled)
+  if (g_runtime_cfg_ready && !g_runtime_cfg.debug_enabled)
     return;
 
   va_list args;
@@ -3171,10 +3171,11 @@ int main(void) {
   (void)rename(LOG_FILE, LOG_FILE_PREV);
 
   log_debug("SHADOWMOUNT+ v%s exFAT/UFS/LVD/MD. Thx to VoidWhisper/Gezine/Earthonion/EchoStretch/Drakmor", SHADOWMOUNT_VERSION);
+  load_runtime_config();
+
   notify_system("ShadowMount+ v%s exFAT/UFS",
                   SHADOWMOUNT_VERSION);
 
-  load_runtime_config();
 
   for (int i = 0; SCAN_PATHS[i] != NULL; i++) {
     DIR *d = opendir(SCAN_PATHS[i]);
