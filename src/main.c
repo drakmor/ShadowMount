@@ -41,8 +41,8 @@
 #define MAX_MISSING_PARAM_SCAN_ATTEMPTS 3
 #define MAX_IMAGE_MOUNT_ATTEMPTS 3
 #define MAX_LAYERED_UNMOUNT_ATTEMPTS 4
-#define LVD1_RELEASE_WAIT_MAX_US 15000000u
-#define LVD1_RELEASE_WAIT_POLL_US 500000u
+#define LVD_RELEASE_WAIT_MAX_US 15000000u
+#define LVD_RELEASE_WAIT_POLL_US 500000u
 #define IMAGE_MOUNT_READ_ONLY 1
 #define MIN_SCAN_INTERVAL_SECONDS 1u
 #define MAX_SCAN_INTERVAL_SECONDS 3600u
@@ -2226,24 +2226,24 @@ static bool is_active_image_mount_point(const char *path) {
 }
 
 static bool wait_for_lvd1_release(void) {
-  for (unsigned int waited_us = 0;; waited_us += LVD1_RELEASE_WAIT_POLL_US) {
+  for (unsigned int waited_us = 0;; waited_us += LVD_RELEASE_WAIT_POLL_US) {
     struct statfs *mntbuf = NULL;
     int mntcount = getmntinfo(&mntbuf, MNT_NOWAIT);
     bool mounted = false;
     for (int i = 0; i < mntcount && mntbuf; i++) {
-      if (strcmp(mntbuf[i].f_mntfromname, "/dev/lvd1") != 0)
+      if (strcmp(mntbuf[i].f_mntfromname, "/dev/lvd2") != 0)
         continue;
       mounted = true;
       break;
     }
     if (!mounted) {
       if (waited_us != 0)
-        log_debug("  [IMG][LVD] /dev/lvd1 released");
+        log_debug("  [IMG][LVD] /dev/lvd2 released");
       return true;
     }
 
     if (waited_us == 0) {
-      log_debug("  [IMG][LVD] waiting for /dev/lvd1 to be released...");
+      log_debug("  [IMG][LVD] waiting for /dev/lvd2 to be released...");
       for (int i = 0; i < mntcount && mntbuf; i++) {
         if (strncmp(mntbuf[i].f_mntfromname, "/dev/lvd", 8) != 0)
           continue;
@@ -2264,12 +2264,12 @@ static bool wait_for_lvd1_release(void) {
     }
     if (should_stop_requested())
       return false;
-    if (waited_us >= LVD1_RELEASE_WAIT_MAX_US) {
-      log_debug("  [IMG][LVD] /dev/lvd1 wait timeout reached (%u ms), "
-                "continuing startup", LVD1_RELEASE_WAIT_MAX_US / 1000u);
+    if (waited_us >= LVD_RELEASE_WAIT_MAX_US) {
+      log_debug("  [IMG][LVD] /dev/lvd2 wait timeout reached (%u ms), "
+                "continuing startup", LVD_RELEASE_WAIT_MAX_US / 1000u);
       return true;
     }
-    sceKernelUsleep(LVD1_RELEASE_WAIT_POLL_US);
+    sceKernelUsleep(LVD_RELEASE_WAIT_POLL_US);
   }
 }
 
@@ -3811,7 +3811,7 @@ int main(void) {
 
   cleanup_mount_dirs();
   if (!wait_for_lvd1_release()) {
-    log_debug("[SHUTDOWN] stop requested while waiting /dev/lvd1 release");
+    log_debug("[SHUTDOWN] stop requested while waiting /dev/lvd2 release");
     goto shutdown;
   }
 
